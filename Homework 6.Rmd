@@ -1,0 +1,177 @@
+---
+title: "Homework 6"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidymodels)
+library(ISLR)
+library(ISLR2)
+library(tidyverse)
+library(glmnet)
+library(janitor)
+library(rpart.plot)
+library(ranger)
+library(corrplot)
+library(vip)
+library(xgboost)
+tidymodels_prefer()
+```
+
+```{r}
+poke <- read.csv('Pokemon.csv')
+pokemon <- clean_names(poke)
+```
+
+```{r}
+pokemon <- pokemon%>%filter(type_1 == 'Bug' | type_1== 'Fire' | type_1== 'Grass' | type_1== 'Normal' | type_1== 'Water' | type_1== 'Psychic')
+
+pokemon$legendary <- as.factor(pokemon$legendary)
+
+pokemon$type_1 <- as.factor(pokemon$type_1)
+pokemon$generation <- as.factor(pokemon$generation)
+```
+
+```{r}
+set.seed(608)
+pokeSplit <- initial_split(pokemon, prop = 0.80,
+                                strata = type_1)
+poke_train <- training(pokeSplit)
+poke_test <- testing(pokeSplit)
+```
+
+```{r}
+poke_fold <- vfold_cv(poke_train, v = 5, strata = type_1)
+pokeRecipe <- recipe(type_1 ~ legendary + generation + sp_atk + attack + speed  + defense + hp + sp_def, data = poke_train) %>% step_dummy(all_nominal_predictors()) %>% step_normalize()
+```
+
+```{r}
+poke_train %>% select(where(is.numeric)) %>% select(-x, -total) %>% cor() %>% corrplot(method = 'number')
+```
+None of the relationships are very high, however, defense and hp, speed and defense, speed and hp, sp-def and speed, all have especially low correlations
+
+```{r}
+tree_spec <- decision_tree() %>%
+  set_engine("rpart")
+
+class_tree_spec <- tree_spec %>%
+  set_mode("classification")
+
+class_tree_wf <- workflow() %>%
+  add_model(class_tree_spec %>% set_args(cost_complexity = tune())) %>%
+  add_recipe(pokeRecipe)
+
+param_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+
+tune_res <- tune_grid(
+  class_tree_wf, 
+  resamples = poke_fold, 
+  grid = param_grid, 
+  metrics = metric_set(roc_auc)
+)
+
+autoplot(tune_res)
+```
+It performs better with a smaller cost-complexity parameter
+
+```{r}
+collect_metrics(tune_res)
+arrange(tune_res)
+best_pruned <- select_best(tune_res)
+class_tree_final <- finalize_workflow(class_tree_wf, best_pruned)
+class_final_fit <- fit(class_tree_final, data = poke_train)
+augment(class_final_fit, new_data = poke_test) %>% roc_auc(type_1, estimate = c(.pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water, .pred_Psychic))
+```
+auc = 0.6277206
+
+```{r}
+class_final_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot(roundint = FALSE)
+```
+
+```{r}
+rf_spec <- rand_forest(mtry = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_model(rf_spec %>% set_args(trees = tune(), min_n = tune())) %>%
+  add_recipe(pokeRecipe)
+  
+rf_grid <-  grid_regular(mtry(range = c(1, 8)), trees(range = c(20, 100)), min_n(range = c(2, 40)), levels = 8)
+```
+mtry = number of predictors sampled at each split
+trees = number of trees
+min_n = min number of observations required for another split
+
+at mtry =8 we are using all the predictors in each split. Therefore we can not go higher than 8, similarly, less than 1 is also not plausible because we won't have a useful model if 0 predictors are sampled at each split.
+
+```{r}
+tune_res_rf <- tune_grid(
+  rf_wf, 
+  resamples = poke_fold, 
+  grid = rf_grid, 
+  metrics = metric_set(roc_auc)
+)
+
+autoplot(tune_res_rf)
+```
+
+```{r}
+collect_metrics(tune_res_rf)
+arrange(tune_res_rf)
+best_rf<- select_best(tune_res_rf)
+rf_final <- finalize_workflow(rf_wf, best_rf)
+rf_final_fit <- fit(rf_final, data = poke_train)
+augment(rf_final_fit, new_data = poke_test) %>% roc_auc(type_1, estimate = c(.pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water, .pred_Psychic))
+```
+
+
+
+```{r}
+rf_final_fit %>%
+  extract_fit_parsnip()%>%
+  vip()
+```
+special attack and attack were the most useful, generation was the leasr useful. This is expected since type heavily influences attack and special attack stats.
+
+
+```{r}
+boost_spec <- boost_tree(trees = tune(), tree_depth = 4) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+boost_wf <- workflow() %>%
+  add_model(boost_spec %>% set_args(trees = tune())) %>%
+  add_recipe(pokeRecipe)
+  
+boost_grid <-  grid_regular(trees(range = c(10, 2000)), levels = 10)
+
+boost_tune <- tune_grid(
+  boost_wf, 
+  resamples = poke_fold, 
+  grid = boost_grid, 
+  metrics = metric_set(roc_auc)
+)
+autoplot(boost_tune)
+```
+
+```{r}
+collect_metrics(boost_tune)
+arrange(boost_tune)
+best_boost<- select_best(boost_tune)
+boost_final <- finalize_workflow(boost_wf, best_boost)
+boost_final_fit <- fit(boost_final, data = poke_train)
+augment(boost_final_fit, new_data = poke_test) %>% roc_auc(type_1, estimate = c(.pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water, .pred_Psychic))
+```
+0.6771615
+
+```{r}
+
+```
+
